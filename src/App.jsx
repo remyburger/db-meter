@@ -1,8 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 
 // ---- Token system ----
-// Light, flat UI like a dedicated sound-meter app, with a colorful zone-coded
-// gauge/chart instead of the reference's monochrome look.
 const COLORS = {
   bg: "#eef1f5",
   card: "#ffffff",
@@ -18,23 +16,62 @@ const COLORS = {
   chartFillFrom: "#5cc9e0",
   chartFillTo: "#7c8bff",
   chartLine: "#3fa9c9",
+  accent: "#5b6bff",
 };
 
-// Internal analysis is dBFS (mic RMS). We map it onto a familiar 0-100
-// "sound level" scale purely for a recognizable meter display — this is
-// NOT a calibrated SPL reading.
-const RAW_MIN = -70; // dBFS floor treated as 0 on the display scale
-const RAW_MAX = -5; // dBFS treated as 100 on the display scale
 const DISPLAY_MIN = 0;
 const DISPLAY_MAX = 100;
+const DEFAULT_OFFSET = 100; // rough starting offset until the person calibrates
+const STORAGE_KEY = "decibel-meter-calibration";
+
+// localStorage isn't available inside Claude's artifact preview, but works
+// fine once this is deployed to a real page (e.g. GitHub Pages) — so every
+// call is wrapped defensively.
+function loadSavedCalibration() {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.offset === "number" && Number.isFinite(parsed.offset)) {
+      return parsed.offset;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCalibration(offset) {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ offset }));
+  } catch {
+    // Storage unavailable (e.g. private browsing, artifact preview) — ignore
+  }
+}
+
+function clearSavedCalibration() {
+  try {
+    window.localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
 
 function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
 }
 
-function toDisplayScale(rawDb) {
-  const t = (clamp(rawDb, RAW_MIN, RAW_MAX) - RAW_MIN) / (RAW_MAX - RAW_MIN);
-  return clamp(DISPLAY_MIN + t * (DISPLAY_MAX - DISPLAY_MIN), DISPLAY_MIN, DISPLAY_MAX);
+// Standard IEC 61672-1 A-weighting curve (dB adjustment per frequency)
+function aWeightDb(freq) {
+  if (freq <= 0) return -100;
+  const f2 = freq * freq;
+  const num = Math.pow(12194, 2) * Math.pow(f2, 2);
+  const den =
+    (f2 + Math.pow(20.6, 2)) *
+    Math.sqrt((f2 + Math.pow(107.7, 2)) * (f2 + Math.pow(737.9, 2))) *
+    (f2 + Math.pow(12194, 2));
+  const ra = num / den;
+  return 20 * Math.log10(ra) + 2.0;
 }
 
 function zoneFor(display) {
@@ -45,7 +82,6 @@ function zoneFor(display) {
   return { name: "Loud / traffic", color: COLORS.veryLoud };
 }
 
-// Sweep -120deg (0) to 120deg (100), matching a speedometer-style arc
 function valueToAngle(v) {
   const t = (clamp(v, DISPLAY_MIN, DISPLAY_MAX) - DISPLAY_MIN) / (DISPLAY_MAX - DISPLAY_MIN);
   return -120 + t * 240;
@@ -73,14 +109,21 @@ export default function DecibelMeter() {
   const [maxV, setMaxV] = useState(null);
   const [avgV, setAvgV] = useState(null);
   const [elapsed, setElapsed] = useState(0);
-  const [history, setHistory] = useState([]); // [{t, v}]
+  const [history, setHistory] = useState([]);
   const [errorMsg, setErrorMsg] = useState("");
+  const [isCalibrated, setIsCalibrated] = useState(() => loadSavedCalibration() !== null);
+  const [showCalibrate, setShowCalibrate] = useState(false);
+  const [refInput, setRefInput] = useState("");
 
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
   const streamRef = useRef(null);
   const rafRef = useRef(null);
   const smoothedRef = useRef(DISPLAY_MIN);
+  const rawUncalibratedRef = useRef(-40); // latest raw A-weighted dBFS, pre-offset
+  const savedOffset = useRef(loadSavedCalibration()).current;
+  const offsetRef = useRef(savedOffset !== null ? savedOffset : DEFAULT_OFFSET);
+  const weightTableRef = useRef(null);
   const startTimeRef = useRef(0);
   const lastSampleRef = useRef(0);
   const sumRef = useRef(0);
@@ -127,9 +170,21 @@ export default function DecibelMeter() {
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 2048;
-      analyser.smoothingTimeConstant = 0;
+      analyser.smoothingTimeConstant = 0.2;
+      analyser.minDecibels = -100;
+      analyser.maxDecibels = 0;
       source.connect(analyser);
       analyserRef.current = analyser;
+
+      // Precompute the A-weighting curve for each FFT frequency bin
+      const binCount = analyser.frequencyBinCount;
+      const sampleRate = audioCtx.sampleRate;
+      const weights = new Float32Array(binCount);
+      for (let i = 0; i < binCount; i++) {
+        const freq = (i * sampleRate) / analyser.fftSize;
+        weights[i] = aWeightDb(freq);
+      }
+      weightTableRef.current = weights;
 
       smoothedRef.current = DISPLAY_MIN;
       sumRef.current = 0;
@@ -145,15 +200,24 @@ export default function DecibelMeter() {
       setElapsed(0);
       setStatus("listening");
 
-      const data = new Float32Array(analyser.fftSize);
+      const freqData = new Float32Array(binCount);
 
       const tick = () => {
-        analyser.getFloatTimeDomainData(data);
-        let sumSquares = 0;
-        for (let i = 0; i < data.length; i++) sumSquares += data[i] * data[i];
-        const rms = Math.sqrt(sumSquares / data.length);
-        const raw = rms > 0 ? 20 * Math.log10(rms) : RAW_MIN;
-        const targetDisplay = toDisplayScale(raw);
+        analyser.getFloatFrequencyData(freqData);
+        const w = weightTableRef.current;
+
+        let sumPower = 0;
+        for (let i = 0; i < freqData.length; i++) {
+          const db = freqData[i];
+          if (!isFinite(db)) continue;
+          const weightedDb = db + w[i];
+          sumPower += Math.pow(10, weightedDb / 10);
+        }
+        const rawADb = sumPower > 0 ? 10 * Math.log10(sumPower) : -100;
+        rawUncalibratedRef.current = rawADb;
+
+        const calibratedDb = rawADb + offsetRef.current;
+        const targetDisplay = clamp(calibratedDb, DISPLAY_MIN, DISPLAY_MAX);
 
         const smoothing = targetDisplay > smoothedRef.current ? 0.45 : 0.15;
         smoothedRef.current += (targetDisplay - smoothedRef.current) * smoothing;
@@ -214,6 +278,24 @@ export default function DecibelMeter() {
     setHistory([]);
   };
 
+  const applyCalibration = () => {
+    const refValue = parseFloat(refInput);
+    if (Number.isFinite(refValue)) {
+      const newOffset = refValue - rawUncalibratedRef.current;
+      offsetRef.current = newOffset;
+      saveCalibration(newOffset);
+      setIsCalibrated(true);
+    }
+    setShowCalibrate(false);
+    setRefInput("");
+  };
+
+  const clearCalibration = () => {
+    offsetRef.current = DEFAULT_OFFSET;
+    clearSavedCalibration();
+    setIsCalibrated(false);
+  };
+
   const zone = zoneFor(display);
   const needleAngle = valueToAngle(display);
 
@@ -261,7 +343,6 @@ export default function DecibelMeter() {
 
   const needleTip = polar(cx, cy, r - 20, needleAngle);
 
-  // Chart geometry
   const chartW = 300;
   const chartH = 110;
   const chartPadL = 30;
@@ -345,29 +426,94 @@ export default function DecibelMeter() {
           >
             SOUND METER
           </span>
-          <div
+          <button
+            onClick={() => setShowCalibrate((s) => !s)}
+            disabled={!isLive}
+            title="Calibrate"
             style={{
               width: 38,
               height: 38,
               borderRadius: 12,
-              border: `1px solid ${COLORS.border}`,
+              border: `1px solid ${isCalibrated ? COLORS.accent : COLORS.border}`,
               background: COLORS.card,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
+              fontSize: 15,
+              cursor: isLive ? "pointer" : "default",
+              color: isCalibrated ? COLORS.accent : COLORS.textSecondary,
             }}
           >
-            <span
-              style={{
-                width: 9,
-                height: 9,
-                borderRadius: "50%",
-                background: isLive ? COLORS.quiet : COLORS.textSecondary,
-                display: "inline-block",
-              }}
-            />
-          </div>
+            ⚙
+          </button>
         </div>
+
+        {showCalibrate && (
+          <div
+            style={{
+              background: COLORS.card,
+              border: `1px solid ${COLORS.border}`,
+              borderRadius: 16,
+              padding: "14px 16px",
+              marginBottom: 12,
+              boxShadow: "0 8px 24px rgba(35,40,56,0.06)",
+            }}
+          >
+            <div style={{ fontSize: 12.5, color: COLORS.textPrimary, marginBottom: 8, lineHeight: 1.4 }}>
+              Hold this next to a reference meter reading the same sound, then
+              enter its dB value to calibrate.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                type="number"
+                inputMode="decimal"
+                placeholder="e.g. 62"
+                value={refInput}
+                onChange={(e) => setRefInput(e.target.value)}
+                style={{
+                  flex: 1,
+                  border: `1px solid ${COLORS.border}`,
+                  borderRadius: 10,
+                  padding: "8px 10px",
+                  fontSize: 14,
+                  color: COLORS.textPrimary,
+                }}
+              />
+              <button
+                onClick={applyCalibration}
+                style={{
+                  background: COLORS.accent,
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: 10,
+                  padding: "8px 14px",
+                  fontSize: 13,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                Set
+              </button>
+            </div>
+            {isCalibrated && (
+              <button
+                onClick={clearCalibration}
+                style={{
+                  marginTop: 8,
+                  background: "none",
+                  border: "none",
+                  color: COLORS.textSecondary,
+                  fontSize: 11.5,
+                  textDecoration: "underline",
+                  cursor: "pointer",
+                  padding: 0,
+                }}
+              >
+                Clear calibration
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Gauge card */}
         <div
@@ -380,7 +526,6 @@ export default function DecibelMeter() {
           }}
         >
           <svg viewBox="0 0 300 190" width="100%" style={{ display: "block" }}>
-            {/* Track */}
             <path
               d={arcPath(cx, cy, r, valueToAngle(0), valueToAngle(100))}
               fill="none"
@@ -388,7 +533,6 @@ export default function DecibelMeter() {
               strokeWidth={10}
               strokeLinecap="round"
             />
-            {/* Zone-colored progress */}
             <path
               d={arcPath(cx, cy, r, valueToAngle(0), needleAngle)}
               fill="none"
@@ -441,7 +585,7 @@ export default function DecibelMeter() {
                   marginTop: 6,
                 }}
               >
-                dB
+                dBA
                 <br />
                 {isLive ? fmtElapsed(elapsed) : "--:--"}
               </span>
@@ -458,14 +602,23 @@ export default function DecibelMeter() {
                 ? `${Math.round(display)} dB: ${zone.name}`
                 : "Not running"}
             </div>
+            <div
+              style={{
+                marginTop: 2,
+                fontSize: 10.5,
+                fontWeight: 600,
+                color: isCalibrated ? COLORS.accent : COLORS.textSecondary,
+              }}
+            >
+              {isCalibrated ? "Calibrated" : "Estimated (not calibrated)"}
+            </div>
           </div>
 
-          {/* Min/Avg/Max */}
           <div
             style={{
               display: "grid",
               gridTemplateColumns: "1fr 1fr 1fr",
-              marginTop: 14,
+              marginTop: 12,
               paddingTop: 12,
               borderTop: `1px solid ${COLORS.border}`,
               textAlign: "center",
@@ -521,7 +674,6 @@ export default function DecibelMeter() {
               </linearGradient>
             </defs>
 
-            {/* Y gridlines */}
             {[0, 20, 40, 60, 80, 100].map((g) => {
               const y = chartPadT + plotH * (1 - g / 100);
               return (
@@ -553,13 +705,7 @@ export default function DecibelMeter() {
               <path d={linePath} fill="none" stroke={COLORS.chartLine} strokeWidth={1.75} />
             )}
 
-            <text
-              x={chartPadL}
-              y={9}
-              fontSize="8"
-              fill={COLORS.textSecondary}
-              fontWeight="700"
-            >
+            <text x={chartPadL} y={9} fontSize="8" fill={COLORS.textSecondary} fontWeight="700">
               dB
             </text>
             <text
@@ -575,7 +721,6 @@ export default function DecibelMeter() {
           </svg>
         </div>
 
-        {/* Controls */}
         <div style={{ marginTop: 14 }}>
           {!isLive ? (
             <button
@@ -641,8 +786,9 @@ export default function DecibelMeter() {
             lineHeight: 1.5,
           }}
         >
-          Reads relative level from your mic and maps it to a familiar 0–100
-          scale — not a calibrated SPL reading.
+          Uses A-weighting (dBA) to match human hearing. Calibrate against a
+          reference meter for a closer real-world estimate — your
+          calibration is saved on this device and stays put between visits.
         </div>
       </div>
     </div>
