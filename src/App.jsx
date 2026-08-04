@@ -727,7 +727,7 @@ export default function DecibelMeter() {
               onClick={startListening}
               style={{
                 width: "100%",
-                background: COLORS.chartLine,
+                background: COLORS.accent,
                 color: "#fff",
                 border: "none",
                 borderRadius: 14,
