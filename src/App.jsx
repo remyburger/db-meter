@@ -428,7 +428,6 @@ export default function DecibelMeter() {
           </span>
           <button
             onClick={() => setShowCalibrate((s) => !s)}
-            disabled={!isLive}
             title="Calibrate"
             style={{
               width: 38,
@@ -440,7 +439,7 @@ export default function DecibelMeter() {
               alignItems: "center",
               justifyContent: "center",
               fontSize: 15,
-              cursor: isLive ? "pointer" : "default",
+              cursor: "pointer",
               color: isCalibrated ? COLORS.accent : COLORS.textSecondary,
             }}
           >
@@ -459,6 +458,13 @@ export default function DecibelMeter() {
               boxShadow: "0 8px 24px rgba(35,40,56,0.06)",
             }}
           >
+            {!isLive ? (
+              <div style={{ fontSize: 12.5, color: COLORS.textSecondary, lineHeight: 1.4 }}>
+                Start the meter first, then come back here to calibrate
+                against a reference reading.
+              </div>
+            ) : (
+              <>
             <div style={{ fontSize: 12.5, color: COLORS.textPrimary, marginBottom: 8, lineHeight: 1.4 }}>
               Hold this next to a reference meter reading the same sound, then
               enter its dB value to calibrate.
@@ -511,6 +517,8 @@ export default function DecibelMeter() {
               >
                 Clear calibration
               </button>
+            )}
+              </>
             )}
           </div>
         )}
